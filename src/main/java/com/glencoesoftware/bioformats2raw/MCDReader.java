@@ -11,6 +11,9 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.BitSet;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 
 import loci.common.ByteArrayHandle;
 import loci.common.Location;
@@ -77,6 +80,15 @@ public class MCDReader extends FormatReader {
 
     LOGGER.debug("Reading raw acquisition #{}", getSeries() - panoramas.size());
     Acquisition currentAcq = acquisitions.get(getSeries() - panoramas.size());
+    
+    if (!isRowMajor(currentAcq)) {
+      // Polygon-clipped or aborted acquisition, or shots not stored in
+      // row-major order: fixed-stride seeking would return misplaced data.
+      // Use each shot's embedded (X, Y) position instead.
+      openSparseBytes(currentAcq, no, buf, x, y, w, h);
+      return buf;
+    }
+
     in.seek(currentAcq.start);
     LOGGER.debug("File offset = {}", in.getFilePointer());
 
@@ -120,6 +132,14 @@ public class MCDReader extends FormatReader {
     }
     for (Panorama p : panoramas) {
       p.unmap();
+    }
+    // free the cached per-acquisition decode buffers (see
+    // ensureSparseDataLoaded()); these are only populated for
+    // non-row-major acquisitions and can be large, so don't wait
+    // for the Acquisition objects themselves to be collected
+    for (Acquisition acq : acquisitions) {
+      acq.decodedValues = null;
+      acq.decodedMask = null;
     }
     if (!fileOnly) {
       pngHelper = null;
@@ -265,8 +285,24 @@ public class MCDReader extends FormatReader {
       }
 
       m.imageCount = m.sizeC * m.sizeZ * m.sizeT;
-      if (totalPlanes < m.imageCount) {
-        LOGGER.warn("Not enough pixel bytes in file; images may be blank");
+
+      // A full raster stores exactly sizeX * sizeY shots. Fewer shots means
+      // some positions were never ablated (polygon-shaped ROI, or an
+      // acquisition aborted part way through).
+      long expectedBytes =
+        (long) acq.sizeX * acq.sizeY * m.imageCount * acq.bpp;
+      LOGGER.debug("Acquisition '{}': DataStartOffset={}, " +
+          "DataEndOffset={}, file length={}, {}x{} x {} ch x {} bpp -> " +
+          "totalBytes={}, expectedBytes={}",
+          acq.description, acq.start, acq.end, in.length(), acq.sizeX,
+          acq.sizeY, m.imageCount, acq.bpp, totalBytes, expectedBytes);
+
+      acq.isDenseRectangular = (totalBytes == expectedBytes);
+      if (!acq.isDenseRectangular) {
+        LOGGER.info("Acquisition {} has {} pixel bytes, a full raster would " +
+          "be {}; reading by per-shot coordinates, positions without a " +
+          "recorded shot will be left at the fill color",
+          acq.description, totalBytes, expectedBytes);
       }
 
       m.dimensionOrder = "XYCZT";
@@ -339,6 +375,219 @@ public class MCDReader extends FormatReader {
   {
     int len = s.readInt();
     return s.readString(len);
+  }
+
+  /**
+   * Find the raw (interleaved) channel positions of the X and Y coordinates
+   * stored with every shot. These are channels 0 and 1 in every file seen so
+   * far, but the channel names are checked in case the order ever differs.
+   *
+   * @param acq acquisition to inspect
+   * @return two element array: raw X channel, raw Y channel
+   */
+  private int[] findXYChannels(Acquisition acq) {
+    int rawX = 0;
+    int rawY = 1;
+    for (int c = 0; c < acq.channelIndexes.size(); c++) {
+      int idx = acq.channelIndexes.get(c);
+      if (idx < 0 || idx >= channels.size()) {
+        continue;
+      }
+      Channel ch = channels.get(idx);
+      if ("X".equalsIgnoreCase(ch.name) || "X".equalsIgnoreCase(ch.label)) {
+        rawX = c;
+      }
+      else if ("Y".equalsIgnoreCase(ch.name) ||
+        "Y".equalsIgnoreCase(ch.label))
+      {
+        rawY = c;
+      }
+    }
+    return new int[] {rawX, rawY};
+  }
+
+  /**
+   * Check whether an acquisition really is a full raster stored in
+   * row-major order, i.e. shot N sits at X = N % sizeX, Y = N / sizeX.
+   * A shot count equal to sizeX * sizeY does not guarantee this, so the
+   * coordinates embedded in every shot are checked (once, then cached).
+   * Only then is it safe to read planes by seeking with a fixed stride.
+   *
+   * @param acq acquisition to check
+   * @return true if the fixed-stride read is safe
+   * @throws IOException if the pixel data cannot be read
+   */
+  private boolean isRowMajor(Acquisition acq) throws IOException {
+    if (acq.rowMajor != null) {
+      return acq.rowMajor;
+    }
+    if (!acq.isDenseRectangular) {
+      acq.rowMajor = Boolean.FALSE;
+      return false;
+    }
+
+    int[] xy = findXYChannels(acq);
+    int bytesPerShot = acq.channelIndexes.size() * 4;
+    long totalShots = (acq.end - acq.start) / bytesPerShot;
+    int shotsPerChunk = 65536;
+    byte[] chunk = new byte[shotsPerChunk * bytesPerShot];
+    ByteBuffer bb = ByteBuffer.wrap(chunk).order(ByteOrder.LITTLE_ENDIAN);
+
+    boolean ok = true;
+    long savedOffset = in.getFilePointer();
+    try {
+      in.seek(acq.start);
+      long shot = 0;
+      while (ok && shot < totalShots) {
+        int n = (int) Math.min(shotsPerChunk, totalShots - shot);
+        in.readFully(chunk, 0, n * bytesPerShot);
+        for (int i = 0; i < n; i++) {
+          int base = i * bytesPerShot;
+          long expected = shot + i;
+          if (Math.round(bb.getFloat(base + (xy[0] * 4))) !=
+            (int) (expected % acq.sizeX) ||
+            Math.round(bb.getFloat(base + (xy[1] * 4))) !=
+            (int) (expected / acq.sizeX))
+          {
+            ok = false;
+            break;
+          }
+        }
+        shot += n;
+      }
+    }
+    finally {
+      in.seek(savedOffset);
+    }
+
+    LOGGER.debug("Acquisition {} row-major layout check: {}",
+      acq.description, ok);
+    acq.rowMajor = ok;
+    return ok;
+  }
+
+  /**
+   * Read a tile of one channel from an acquisition that is not a full
+   * row-major raster (e.g. a polygon-shaped ROI).
+   * Positions that have no recorded shot are left untouched in buf,
+   * i.e. at the fill color.
+   *
+   * @param acq acquisition to read from
+   * @param no plane (channel) index
+   * @param buf buffer to fill, already initialized with the fill color
+   * @param x tile X offset
+   * @param y tile Y offset
+   * @param w tile width
+   * @param h tile height
+   * @throws FormatException if the acquisition cannot be decoded
+   * @throws IOException if the pixel data cannot be read
+   */
+  private void openSparseBytes(Acquisition acq, int no, byte[] buf,
+    int x, int y, int w, int h) throws FormatException, IOException
+  {
+    ensureSparseDataLoaded(acq);
+
+    int bpp = FormatTools.getBytesPerPixel(getPixelType());
+    int numChannels = acq.channelIndexes.size();
+    int rawChan = getReversePlaneIndex(no);
+
+    ByteBuffer out = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
+    for (int row = 0; row < h; row++) {
+      int py = y + row;
+      for (int col = 0; col < w; col++) {
+        int px = x + col;
+        int pos = py * acq.sizeX + px;
+        if (acq.decodedMask.get(pos)) {
+          out.putFloat(((row * w) + col) * bpp,
+            acq.decodedValues[(pos * numChannels) + rawChan]);
+        }
+      }
+    }
+  }
+
+  /**
+   * Decode the pixel records of an acquisition into a dense grid, once,
+   * caching the result on the Acquisition.
+   *
+   * Each pixel record ("shot") holds one float per channel; the first three
+   * values of every record are that shot's own X, Y and Z position. Every
+   * record is placed at its own (X, Y), rather than assuming records arrive
+   * in row-major order.
+   *
+   * Note: this holds sizeX * sizeY * channelCount floats in memory for the
+   * acquisition. It is only used for acquisitions that are not verified to
+   * be a row-major raster.
+   *
+   * @param acq acquisition to decode
+   * @throws FormatException if the acquisition is too large to decode
+   * @throws IOException if the pixel data cannot be read
+   */
+  private void ensureSparseDataLoaded(Acquisition acq)
+    throws FormatException, IOException
+  {
+    if (acq.decodedValues != null) {
+      return;
+    }
+
+    int numChannels = acq.channelIndexes.size();
+    long gridPixels = (long) acq.sizeX * acq.sizeY;
+    if (gridPixels * numChannels > Integer.MAX_VALUE - 8) {
+      throw new FormatException("Acquisition " + acq.description +
+        " is too large to be read by per-shot coordinates");
+    }
+
+    int[] xy = findXYChannels(acq);
+    int rawX = xy[0];
+    int rawY = xy[1];
+
+    LOGGER.debug("Decoding acquisition {} into a {} x {} grid",
+      acq.description, acq.sizeX, acq.sizeY);
+
+    float[] values = new float[(int) gridPixels * numChannels];
+    BitSet mask = new BitSet((int) gridPixels);
+
+    long savedOffset = in.getFilePointer();
+    boolean savedOrder = in.isLittleEndian();
+    try {
+      in.seek(acq.start);
+      in.order(true);
+
+      int bytesPerShot = numChannels * 4;
+      long totalShots = (acq.end - acq.start) / bytesPerShot;
+      int shotsPerChunk = 65536;
+      byte[] chunk = new byte[shotsPerChunk * bytesPerShot];
+      ByteBuffer bb = ByteBuffer.wrap(chunk).order(ByteOrder.LITTLE_ENDIAN);
+
+      long shot = 0;
+      while (shot < totalShots) {
+        int n = (int) Math.min(shotsPerChunk, totalShots - shot);
+        in.readFully(chunk, 0, n * bytesPerShot);
+        bb.clear();
+
+        for (int i = 0; i < n; i++) {
+          int base = i * bytesPerShot;
+          int px = Math.round(bb.getFloat(base + (rawX * 4)));
+          int py = Math.round(bb.getFloat(base + (rawY * 4)));
+          if (px < 0 || px >= acq.sizeX || py < 0 || py >= acq.sizeY) {
+            continue;
+          }
+          int pos = (py * acq.sizeX) + px;
+          mask.set(pos);
+          int dest = pos * numChannels;
+          for (int c = 0; c < numChannels; c++) {
+            values[dest + c] = bb.getFloat(base + (c * 4));
+          }
+        }
+        shot += n;
+      }
+
+      acq.decodedValues = values;
+      acq.decodedMask = mask;
+    }
+    finally {
+      in.seek(savedOffset);
+      in.order(savedOrder);
+    }
   }
 
   /**
@@ -573,6 +822,28 @@ public class MCDReader extends FormatReader {
 
     /** Indexes into list of channels; length matches SizeC. */
     public List<Integer> channelIndexes;
+
+    /**
+     * True if the pixel data contains exactly sizeX * sizeY shots. False for
+     * e.g. polygon-shaped ROIs or aborted acquisitions, which contain fewer.
+     * This does not guarantee row-major order; see isRowMajor.
+     */
+    public boolean isDenseRectangular = true;
+
+    /**
+     * Lazily decoded pixel data for sparse acquisitions, indexed as
+     * (y * sizeX + x) * channelCount + rawChannel. Null until first read.
+     */
+    public float[] decodedValues = null;
+
+    /**
+     * Result of the row-major layout check (see isRowMajor); null until
+     * first read.
+     */
+    public Boolean rowMajor = null;
+
+    /** Which raster positions have a recorded shot. */
+    public BitSet decodedMask = null;
   }
 
   /**
